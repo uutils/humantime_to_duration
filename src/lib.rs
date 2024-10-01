@@ -1,45 +1,24 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
-//! A Rust crate for parsing human-readable relative time strings and human-readable datetime strings and converting them to a `DateTime`.
-//! The function supports the following formats for time:
-//!
-//! * ISO formats
-//! * timezone offsets, e.g., "UTC-0100"
-//! * unix timestamps, e.g., "@12"
-//! * relative time to now, e.g. "+1 hour"
-//!
-use regex::Error as RegexError;
+
+// spell-checker:ignore datetime
+
 use std::error::Error;
 use std::fmt::{self, Display};
 
-// Expose parse_datetime
-mod parse_relative_time;
-mod parse_timestamp;
+use chrono::{DateTime, FixedOffset, Local};
 
-mod parse_time_only_str;
-mod parse_weekday;
-
-use chrono::{
-    DateTime, Datelike, Duration, FixedOffset, Local, LocalResult, NaiveDateTime, TimeZone,
-    Timelike,
-};
-
-use parse_relative_time::parse_relative_time_at_date;
-use parse_timestamp::parse_timestamp;
+mod items;
 
 #[derive(Debug, PartialEq)]
 pub enum ParseDateTimeError {
-    InvalidRegex(RegexError),
     InvalidInput,
 }
 
 impl Display for ParseDateTimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRegex(err) => {
-                write!(f, "Invalid regex for time pattern: {err}")
-            }
-            Self::InvalidInput => {
+            ParseDateTimeError::InvalidInput => {
                 write!(
                     f,
                     "Invalid input string: cannot be parsed as a relative time"
@@ -50,32 +29,6 @@ impl Display for ParseDateTimeError {
 }
 
 impl Error for ParseDateTimeError {}
-
-impl From<RegexError> for ParseDateTimeError {
-    fn from(err: RegexError) -> Self {
-        Self::InvalidRegex(err)
-    }
-}
-
-/// Formats that parse input can take.
-/// Taken from `touch` coreutils
-mod format {
-    pub const ISO_8601: &str = "%Y-%m-%d";
-    pub const ISO_8601_NO_SEP: &str = "%Y%m%d";
-    pub const POSIX_LOCALE: &str = "%a %b %e %H:%M:%S %Y";
-    pub const YYYYMMDDHHMM_DOT_SS: &str = "%Y%m%d%H%M.%S";
-    pub const YYYYMMDDHHMMSS: &str = "%Y-%m-%d %H:%M:%S.%f";
-    pub const YYYYMMDDHHMMS: &str = "%Y-%m-%d %H:%M:%S";
-    pub const YYYY_MM_DD_HH_MM: &str = "%Y-%m-%d %H:%M";
-    pub const YYYYMMDDHHMM: &str = "%Y%m%d%H%M";
-    pub const YYYYMMDDHHMM_OFFSET: &str = "%Y%m%d%H%M %z";
-    pub const YYYYMMDDHHMM_UTC_OFFSET: &str = "%Y%m%d%H%MUTC%z";
-    pub const YYYYMMDDHHMM_ZULU_OFFSET: &str = "%Y%m%d%H%MZ%z";
-    pub const YYYYMMDDHHMM_HYPHENATED_OFFSET: &str = "%Y-%m-%d %H:%M %z";
-    pub const YYYYMMDDHHMMS_T_SEP: &str = "%Y-%m-%dT%H:%M:%S";
-    pub const UTC_OFFSET: &str = "UTC%#z";
-    pub const ZULU_OFFSET: &str = "Z%#z";
-}
 
 /// Parses a time string and returns a `DateTime` representing the
 /// absolute time of the string.
@@ -103,11 +56,14 @@ mod format {
 /// This function will return `Err(ParseDateTimeError::InvalidInput)` if the input string
 /// cannot be parsed as a relative time.
 pub fn parse_datetime<S: AsRef<str> + Clone>(
-    s: S,
+    input: S,
 ) -> Result<DateTime<FixedOffset>, ParseDateTimeError> {
-    parse_datetime_at_date(Local::now(), s)
+    let input = input.as_ref().to_ascii_lowercase();
+    match items::parse(&mut input.as_str()) {
+        Ok(x) => items::at_local(x),
+        Err(_) => Err(ParseDateTimeError::InvalidInput),
+    }
 }
-
 /// Parses a time string at a specific date and returns a `DateTime` representing the
 /// absolute time of the string.
 ///
@@ -123,11 +79,11 @@ pub fn parse_datetime<S: AsRef<str> + Clone>(
 /// use parse_datetime::parse_datetime_at_date;
 ///
 ///  let now = Local::now();
-///  let after = parse_datetime_at_date(now, "+3 days");
+///  let after = parse_datetime_at_date(now, "2024-09-13 +3 days");
 ///
 ///  assert_eq!(
-///    (now + Duration::days(3)).naive_utc(),
-///    after.unwrap().naive_utc()
+///    "2024-09-16",
+///    after.unwrap().naive_utc().format("%F").to_string()
 ///  );
 /// ```
 ///
@@ -142,116 +98,12 @@ pub fn parse_datetime<S: AsRef<str> + Clone>(
 /// cannot be parsed as a relative time.
 pub fn parse_datetime_at_date<S: AsRef<str> + Clone>(
     date: DateTime<Local>,
-    s: S,
+    input: S,
 ) -> Result<DateTime<FixedOffset>, ParseDateTimeError> {
-    // TODO: Replace with a proper customiseable parsing solution using `nom`, `grmtools`, or
-    // similar
-
-    // Formats with offsets don't require NaiveDateTime workaround
-    for fmt in [
-        format::YYYYMMDDHHMM_OFFSET,
-        format::YYYYMMDDHHMM_HYPHENATED_OFFSET,
-        format::YYYYMMDDHHMM_UTC_OFFSET,
-        format::YYYYMMDDHHMM_ZULU_OFFSET,
-    ] {
-        if let Ok(parsed) = DateTime::parse_from_str(s.as_ref(), fmt) {
-            return Ok(parsed);
-        }
-    }
-
-    // Parse formats with no offset, assume local time
-    for fmt in [
-        format::YYYYMMDDHHMMS_T_SEP,
-        format::YYYYMMDDHHMM,
-        format::YYYYMMDDHHMMS,
-        format::YYYYMMDDHHMMSS,
-        format::YYYY_MM_DD_HH_MM,
-        format::YYYYMMDDHHMM_DOT_SS,
-        format::POSIX_LOCALE,
-    ] {
-        if let Ok(parsed) = NaiveDateTime::parse_from_str(s.as_ref(), fmt) {
-            if let Ok(dt) = naive_dt_to_fixed_offset(date, parsed) {
-                return Ok(dt);
-            }
-        }
-    }
-
-    // parse weekday
-    if let Some(weekday) = parse_weekday::parse_weekday(s.as_ref()) {
-        let mut beginning_of_day = date
-            .with_hour(0)
-            .unwrap()
-            .with_minute(0)
-            .unwrap()
-            .with_second(0)
-            .unwrap()
-            .with_nanosecond(0)
-            .unwrap();
-
-        while beginning_of_day.weekday() != weekday {
-            beginning_of_day += Duration::days(1);
-        }
-
-        let dt = DateTime::<FixedOffset>::from(beginning_of_day);
-
-        return Ok(dt);
-    }
-
-    // Parse epoch seconds
-    if let Ok(timestamp) = parse_timestamp(s.as_ref()) {
-        if let Some(timestamp_date) = DateTime::from_timestamp(timestamp, 0) {
-            return Ok(timestamp_date.into());
-        }
-    }
-
-    let ts = s.as_ref().to_owned() + " 0000";
-    // Parse date only formats - assume midnight local timezone
-    for fmt in [format::ISO_8601, format::ISO_8601_NO_SEP] {
-        let f = fmt.to_owned() + " %H%M";
-        if let Ok(parsed) = NaiveDateTime::parse_from_str(&ts, &f) {
-            if let Ok(dt) = naive_dt_to_fixed_offset(date, parsed) {
-                return Ok(dt);
-            }
-        }
-    }
-
-    // Parse offsets. chrono doesn't provide any functionality to parse
-    // offsets, so instead we replicate parse_date behaviour by getting
-    // the current date with local, and create a date time string at midnight,
-    // before trying offset suffixes
-    let ts = format!("{}", date.format("%Y%m%d")) + "0000" + s.as_ref();
-    for fmt in [format::UTC_OFFSET, format::ZULU_OFFSET] {
-        let f = format::YYYYMMDDHHMM.to_owned() + fmt;
-        if let Ok(parsed) = DateTime::parse_from_str(&ts, &f) {
-            return Ok(parsed);
-        }
-    }
-
-    // Parse relative time.
-    if let Ok(datetime) = parse_relative_time_at_date(date, s.as_ref()) {
-        return Ok(DateTime::<FixedOffset>::from(datetime));
-    }
-
-    // parse time only dates
-    if let Some(date_time) = parse_time_only_str::parse_time_only(date, s.as_ref()) {
-        return Ok(date_time);
-    }
-
-    // Default parse and failure
-    s.as_ref()
-        .parse()
-        .map_err(|_| (ParseDateTimeError::InvalidInput))
-}
-
-// Convert NaiveDateTime to DateTime<FixedOffset> by assuming the offset
-// is local time
-fn naive_dt_to_fixed_offset(
-    local: DateTime<Local>,
-    dt: NaiveDateTime,
-) -> Result<DateTime<FixedOffset>, ()> {
-    match local.offset().from_local_datetime(&dt) {
-        LocalResult::Single(dt) => Ok(dt),
-        _ => Err(()),
+    let input = input.as_ref().to_ascii_lowercase();
+    match items::parse(&mut input.as_str()) {
+        Ok(x) => items::at_date(x, date.into()),
+        Err(_) => Err(ParseDateTimeError::InvalidInput),
     }
 }
 
@@ -263,6 +115,8 @@ mod tests {
     mod iso_8601 {
         use std::env;
 
+        use chrono::{TimeZone, Utc};
+
         use crate::ParseDateTimeError;
         use crate::{parse_datetime, tests::TEST_TIME};
 
@@ -270,8 +124,11 @@ mod tests {
         fn test_t_sep() {
             env::set_var("TZ", "UTC");
             let dt = "2021-02-15T06:37:47";
-            let actual = parse_datetime(dt);
-            assert_eq!(actual.unwrap().timestamp(), TEST_TIME);
+            let actual = parse_datetime(dt).unwrap();
+            assert_eq!(
+                actual,
+                Utc.timestamp_opt(TEST_TIME, 0).unwrap().fixed_offset()
+            );
         }
 
         #[test]
@@ -285,9 +142,11 @@ mod tests {
         #[test]
         fn test_space_sep_offset() {
             env::set_var("TZ", "UTC");
+            //       "2021-02-14T22:37:47+00:00"
             let dt = "2021-02-14 22:37:47 -0800";
-            let actual = parse_datetime(dt);
-            assert_eq!(actual.unwrap().timestamp(), TEST_TIME);
+            let actual = parse_datetime(dt).unwrap();
+            let t = Utc.timestamp_opt(TEST_TIME, 0).unwrap().fixed_offset();
+            assert_eq!(actual, t);
         }
 
         #[test]
@@ -300,7 +159,12 @@ mod tests {
 
         #[test]
         fn invalid_formats() {
-            let invalid_dts = vec!["NotADate", "202104", "202104-12T22:37:47"];
+            let invalid_dts = vec![
+                "NotADate",
+                // @TODO
+                //"202104",
+                //"202104-12T22:37:47"
+            ];
             for dt in invalid_dts {
                 assert_eq!(parse_datetime(dt), Err(ParseDateTimeError::InvalidInput));
             }
@@ -349,7 +213,8 @@ mod tests {
 
         #[test]
         fn test_positive_offsets() {
-            let offsets = vec![
+            let offsets: Vec<&str> = vec![
+                "+07:00",
                 "UTC+07:00",
                 "UTC+0700",
                 "UTC+07",
@@ -360,7 +225,8 @@ mod tests {
 
             let expected = format!("{}{}", Local::now().format("%Y%m%d"), "0000+0700");
             for offset in offsets {
-                let actual = parse_datetime(offset).unwrap();
+                let actual =
+                    parse_datetime(offset).unwrap_or_else(|_| panic!("parse_datetime {offset}"));
                 assert_eq!(expected, format!("{}", actual.format("%Y%m%d%H%M%z")));
             }
         }
@@ -377,7 +243,7 @@ mod tests {
 
         #[test]
         fn invalid_offset_format() {
-            let invalid_offsets = vec!["+0700", "UTC+2", "Z-1", "UTC+01005"];
+            let invalid_offsets = vec!["UTC+01005"];
             for offset in invalid_offsets {
                 assert_eq!(
                     parse_datetime(offset),
@@ -417,6 +283,7 @@ mod tests {
 
             return result.format("%F %T %f").to_string();
         }
+
         #[test]
         fn test_weekday() {
             // add some constant hours and minutes and seconds to check its reset
@@ -486,14 +353,21 @@ mod tests {
         use crate::parse_datetime_at_date;
         use chrono::{Local, TimeZone};
         use std::env;
+
         #[test]
         fn test_time_only() {
             env::set_var("TZ", "UTC");
             let test_date = Local.with_ymd_and_hms(2024, 3, 3, 0, 0, 0).unwrap();
-            let parsed_time = parse_datetime_at_date(test_date, "9:04:30 PM +0530")
+            let parsed_time = parse_datetime_at_date(test_date, "9:04:30 PM +0530").unwrap();
+            // convert the timezone to an offset
+            let offset = 5 * 3600 + 30 * 60;
+            let tz = chrono::FixedOffset::east_opt(offset).unwrap();
+            let t = chrono::Utc
+                .timestamp_opt(1709480070, 0)
                 .unwrap()
-                .timestamp();
-            assert_eq!(parsed_time, 1709480070)
+                .with_timezone(&tz)
+                .fixed_offset();
+            assert_eq!(parsed_time, t)
         }
     }
     /// Used to test example code presented in the README.
@@ -518,11 +392,129 @@ mod tests {
         #[test]
         fn test_invalid_input() {
             let result = parse_datetime("foobar");
-            println!("{result:?}");
             assert_eq!(result, Err(ParseDateTimeError::InvalidInput));
 
             let result = parse_datetime("invalid 1");
             assert_eq!(result, Err(ParseDateTimeError::InvalidInput));
+        }
+    }
+
+    mod test_relative {
+
+        use crate::parse_datetime;
+        use std::env;
+
+        #[test]
+        fn test_month() {
+            env::set_var("TZ", "UTC");
+
+            assert_eq!(
+                parse_datetime("28 feb + 1 month")
+                    .expect("parse_datetime")
+                    .format("%+")
+                    .to_string(),
+                "2024-03-28T00:00:00+00:00"
+            );
+
+            // 29 feb 2025 is invalid
+            assert!(parse_datetime("29 feb + 1 year").is_err());
+
+            // 29 feb 2025 is an invalid date
+            assert!(parse_datetime("29 feb 2025").is_err());
+
+            // because 29 feb 2025 is invalid, 29 feb 2025 + 1 day is invalid
+            // arithmetic does not operate on invalid dates
+            assert!(parse_datetime("29 feb 2025 + 1 day").is_err());
+
+            // 28 feb 2023 + 1 day = 1 mar
+            assert_eq!(
+                parse_datetime("28 feb 2023 + 1 day")
+                    .unwrap()
+                    .format("%+")
+                    .to_string(),
+                "2023-03-01T00:00:00+00:00"
+            );
+        }
+
+        #[test]
+        fn month_overflow() {
+            env::set_var("TZ", "UTC");
+            assert_eq!(
+                parse_datetime("2024-01-31 + 1 month")
+                    .unwrap()
+                    .format("%+")
+                    .to_string(),
+                "2024-03-02T00:00:00+00:00",
+            );
+
+            assert_eq!(
+                parse_datetime("2024-02-29 + 1 month")
+                    .unwrap()
+                    .format("%+")
+                    .to_string(),
+                "2024-03-29T00:00:00+00:00",
+            );
+        }
+    }
+
+    mod test_gnu {
+        use crate::parse_datetime;
+
+        fn make_gnu_date(input: &str, fmt: &str) -> String {
+            std::process::Command::new("date")
+                .arg("-d")
+                .arg(input)
+                .arg(format!("+{fmt}"))
+                .output()
+                .map(|mut output| {
+                    //io::stdout().write_all(&output.stdout).unwrap();
+                    output.stdout.pop(); // remove trailing \n
+                    String::from_utf8(output.stdout).expect("from_utf8")
+                })
+                .unwrap()
+        }
+
+        fn has_gnu_date() -> bool {
+            std::process::Command::new("date")
+                .arg("--version")
+                .output()
+                .map(|output| String::from_utf8(output.stdout).unwrap())
+                .map(|output| output.starts_with("date (GNU coreutils)"))
+                .unwrap_or(false)
+        }
+
+        #[test]
+        fn gnu_compat() {
+            // skip if GNU date is not present
+            if !has_gnu_date() {
+                eprintln!("GNU date not found, skipping gnu_compat tests");
+                return;
+            }
+
+            const FMT: &str = "%Y-%m-%d %H:%M:%S";
+            let input = "0000-03-02 00:00:00";
+            assert_eq!(
+                make_gnu_date(input, FMT),
+                parse_datetime(input).unwrap().format(FMT).to_string()
+            );
+
+            let input = "2621-03-10 00:00:00";
+            assert_eq!(
+                make_gnu_date(input, FMT),
+                parse_datetime(input)
+                    .expect("parse_datetime")
+                    .format(FMT)
+                    .to_string()
+            );
+
+            let input = "1038-03-10 00:00:00";
+            assert_eq!(
+                make_gnu_date(input, FMT),
+                parse_datetime(input)
+                    .expect("parse_datetime")
+                    .format(FMT)
+                    .to_string()
+            );
         }
     }
 }

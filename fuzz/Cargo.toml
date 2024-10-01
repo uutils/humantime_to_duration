@@ -15,6 +15,9 @@ chrono = { version="0.4", default-features=false, features=["std", "alloc", "clo
 [dependencies.parse_datetime]
 path = "../"
 
+[features]
+debug = ["parse_datetime/debug"]
+
 [[bin]]
 name = "fuzz_parse_datetime"
 path = "fuzz_targets/parse_datetime.rs"
